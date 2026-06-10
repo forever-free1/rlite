@@ -27,6 +27,7 @@ htmlcov/
 logs/
 outputs/
 *.bat
+PLAN.md
 
 # OS
 .DS_Store
