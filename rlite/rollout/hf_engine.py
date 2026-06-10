@@ -48,41 +48,55 @@ class HFRolloutEngine(RolloutEngine):
 
     @torch.no_grad()
     def generate(self, req: RolloutReq) -> RolloutResp:
-        """Generate ``n_samples`` responses per prompt.
+        """Generate ``n_samples`` responses per prompt (batched).
 
-        Returns a ``RolloutResp`` where each trajectory carries:
-        - ``token_ids``: generated token ids (response only).
-        - ``logprobs``: log-probabilities per response token (old policy).
-        - ``final_response``: decoded text.
+        All prompts × samples are generated in a single ``model.generate()``
+        call for maximum GPU throughput.
         """
+        K = req.n_samples
+        N = len(req.prompts)
+        device = self._device
+
+        # ---- 1. Build batched input (repeat each prompt K times) -------
+        flat_prompts = [p for p in req.prompts for _ in range(K)]
+        tokenized = self.tokenizer(
+            flat_prompts, return_tensors="pt", padding=True
+        ).to(device)
+        input_ids = tokenized.input_ids  # [B, L_max]
+        attn_mask = tokenized.attention_mask
+
+        # Record padding-free lengths for response slicing
+        unpadded_lens = attn_mask.sum(dim=1)  # real length of each sequence
+
+        # ---- 2. Generate all responses in one batch --------------------
+        gen_kwargs = {
+            "max_new_tokens": req.max_tokens,
+            "top_p": req.top_p,
+            "do_sample": req.temperature > 0,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+        }
+        if req.temperature > 0:
+            gen_kwargs["temperature"] = req.temperature
+
+        out = self.model.generate(**tokenized, **gen_kwargs)  # [B, L_full]
+
+        # ---- 3. Compute old-policy logprobs (batched forward) ---------
+        all_logprobs = self._compute_logprobs(out)  # [B, L_full-1]
+
+        # ---- 4. Extract per-trajectory results -------------------------
         trajectories: list[Trajectory] = []
-
+        idx = 0
         for task, prompt in zip(req.tasks, req.prompts, strict=True):
-            inputs = self.tokenizer(prompt, return_tensors="pt").to(self._device)
-            prompt_len = inputs.input_ids.shape[1]
-
-            for _ in range(req.n_samples):
-                # --- generate ---
-                out = self.model.generate(
-                    **inputs,
-                    max_new_tokens=req.max_tokens,
-                    temperature=req.temperature if req.temperature > 0 else 1.0,
-                    top_p=req.top_p,
-                    do_sample=req.temperature > 0,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                )
-                full_ids = out[0]  # [prompt + response]
-                gen_ids = full_ids[prompt_len:]  # response only
-
+            for _ in range(K):
+                full_ids = out[idx]
+                p_len = unpadded_lens[idx].item()
+                gen_ids = full_ids[p_len:]
                 response_text = self.tokenizer.decode(
                     gen_ids, skip_special_tokens=True
                 )
-
-                # --- compute old-policy logprobs ---
-                token_lp = self._compute_logprobs(full_ids.unsqueeze(0))
-                # response portion only (shifted by 1 for prediction alignment)
-                response_lp = token_lp[0, prompt_len - 1: prompt_len - 1 + len(gen_ids)]
+                # response logprobs (shifted by 1)
+                response_lp = all_logprobs[idx, p_len - 1: p_len - 1 + len(gen_ids)]
 
                 trajectories.append(
                     Trajectory.from_single_response(
@@ -93,12 +107,11 @@ class HFRolloutEngine(RolloutEngine):
                         logprobs=response_lp.tolist(),
                     )
                 )
+                idx += 1
 
         logger.debug(
             "HF rollout: %d prompts × %d samples = %d trajectories",
-            len(req.tasks),
-            req.n_samples,
-            len(trajectories),
+            N, K, len(trajectories),
         )
         return RolloutResp(
             batch_id=req.batch_id,
