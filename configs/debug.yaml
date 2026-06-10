@@ -1,0 +1,21 @@
+### Debug / smoke-test configuration
+###
+### This config is the absolute minimum to verify the scaffold:
+###   python -m rlite.train --config configs/debug.yaml
+###   python -m rlite.eval  --config configs/debug.yaml
+
+task:
+  name: debug
+
+reward:
+  name: debug
+
+rollout:
+  engine: hf
+  n_samples: 2
+
+algo:
+  name: grpo
+
+trainer:
+  method: lora

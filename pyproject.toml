@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rlite"
+version = "0.1.0"
+description = "A plugin-based LoRA-GRPO/DAPO framework for verifiable LLM skill training"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "rlite contributors"}
+]
+keywords = [
+    "rlhf",
+    "grpo",
+    "dapo",
+    "lora",
+    "llm",
+    "reinforcement-learning",
+    "post-training",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "peft>=0.10.0",
+    "accelerate>=0.28.0",
+    "datasets>=2.18.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+vllm = ["vllm>=0.4.0"]
+ray = ["ray>=2.9.0"]
+deepseek = ["deepspeed>=0.13.0"]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.0",
+]
+docs = [
+    "myst-parser>=2.0",
+    "sphinx>=7.0",
+]
+all = [
+    "rlite[vllm,ray,dev,docs]",
+]
+
+[project.scripts]
+rlite-train = "rlite.train:main"
+rlite-eval = "rlite.eval:main"
+
+[tool.setuptools.packages.find]
+include = ["rlite*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
