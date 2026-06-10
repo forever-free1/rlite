@@ -38,9 +38,10 @@ class HFRolloutEngine(RolloutEngine):
         if adapter_path is not None:
             self.reload_adapter(adapter_path)
 
-        # Ensure a pad token is set
+        # Ensure a pad token is set and padding side is left for decoder-only models
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        self.tokenizer.padding_side = "left"
 
     # ------------------------------------------------------------------
     # Public API
@@ -62,11 +63,9 @@ class HFRolloutEngine(RolloutEngine):
         tokenized = self.tokenizer(
             flat_prompts, return_tensors="pt", padding=True
         ).to(device)
-        input_ids = tokenized.input_ids  # [B, L_max]
+        input_ids = tokenized.input_ids  # [B, L_pad]
         attn_mask = tokenized.attention_mask
-
-        # Record padding-free lengths for response slicing
-        unpadded_lens = attn_mask.sum(dim=1)  # real length of each sequence
+        padded_len = input_ids.shape[1]  # all inputs share this length after padding
 
         # ---- 2. Generate all responses in one batch --------------------
         gen_kwargs = {
@@ -85,18 +84,20 @@ class HFRolloutEngine(RolloutEngine):
         all_logprobs = self._compute_logprobs(out)  # [B, L_full-1]
 
         # ---- 4. Extract per-trajectory results -------------------------
+        # With left-padding, response starts at padded_len for all examples.
         trajectories: list[Trajectory] = []
         idx = 0
         for task, prompt in zip(req.tasks, req.prompts, strict=True):
             for _ in range(K):
                 full_ids = out[idx]
-                p_len = unpadded_lens[idx].item()
-                gen_ids = full_ids[p_len:]
+                gen_ids = full_ids[padded_len:]
+                gen_ids = gen_ids[gen_ids != self.tokenizer.pad_token_id]  # trim trailing pads
                 response_text = self.tokenizer.decode(
                     gen_ids, skip_special_tokens=True
                 )
-                # response logprobs (shifted by 1)
-                response_lp = all_logprobs[idx, p_len - 1: p_len - 1 + len(gen_ids)]
+                # response logprobs: position padded_len-1 predicts token at padded_len
+                resp_start = padded_len - 1
+                response_lp = all_logprobs[idx, resp_start: resp_start + len(gen_ids)]
 
                 trajectories.append(
                     Trajectory.from_single_response(

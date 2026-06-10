@@ -79,6 +79,7 @@ def main(argv: list[str] | None = None) -> None:
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = "left"  # decoder-only models need left padding for batched generation
 
     # ---- Trainer (LoRA) ---------------------------------------------------
     from peft import LoraConfig
