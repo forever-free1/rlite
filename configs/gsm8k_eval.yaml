@@ -1,0 +1,33 @@
+### GSM8K evaluation config
+###
+### Usage:
+###   python -m rlite.eval --config configs/gsm8k_eval.yaml
+###
+### This does NOT train — it only evaluates a base model (or checkpoint)
+### on the GSM8K test set using the gsm8k task/reward/metric plugins.
+
+task:
+  name: gsm8k
+  split: test
+  max_samples: 100
+
+reward:
+  name: gsm8k
+  kwargs:
+    exact_match_weight: 1.0
+    format_reward_weight: 0.5
+    invalid_penalty: -0.5
+
+rollout:
+  engine: hf
+  n_samples: 1
+  temperature: 0.0
+  max_tokens: 256
+  model_name: "Qwen/Qwen2.5-1.5B-Instruct"
+
+algo:
+  name: grpo
+
+trainer:
+  method: lora
+  output_dir: "./outputs/gsm8k_eval"

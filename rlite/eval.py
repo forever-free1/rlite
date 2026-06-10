@@ -3,11 +3,29 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import sys
 from pathlib import Path
 
-from rlite.config import load_config
+from rlite.config import RLiteConfig, load_config
+from rlite.core.types import Trajectory
 from rlite.logging import logger, setup_logging
+
+
+def _load_plugins(cfg: RLiteConfig):
+    """Import the configured task package to trigger plugin registration."""
+    import rlite.plugins.task  # noqa: F401  # debug fallback
+
+    task_name = cfg.task.name
+    if task_name != "debug":
+        try:
+            importlib.import_module(f"rlite.tasks.{task_name}")
+        except ImportError as exc:
+            logger.warning(
+                "Could not import rlite.tasks.%s: %s. Falling back to debug plugins.",
+                task_name,
+                exc,
+            )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -42,19 +60,17 @@ def main(argv: list[str] | None = None) -> None:
     if args.checkpoint:
         logger.info("Checkpoint: %s", args.checkpoint)
 
-    # 3. import debug plugins
-    import rlite.plugins.task  # noqa: F401
+    # 3. import plugins
+    _load_plugins(cfg)
 
-    # 4. resolve plugins
+    # 4. resolve plugins from registry
     from rlite.registry import metric_registry, reward_registry, task_registry
 
     task_plugin = task_registry.create(cfg.task.name)
-    reward_plugin = reward_registry.create(cfg.reward.name)
-    metric_plugin = metric_registry.create(cfg.reward.name)
+    reward_plugin = reward_registry.create(cfg.reward.name, **cfg.reward.kwargs)
+    metric_plugin = metric_registry.create(cfg.task.name)
 
-    from rlite.core.types import Trajectory
-
-    # 5. eval dry-run: create simulated trajectories using real types
+    # 5. eval: load tasks, create dummy trajectories, score and compute metrics
     tasks = list(task_plugin.load_dataset(split=cfg.task.split, max_samples=cfg.task.max_samples))
     logger.info("Loaded %d tasks for evaluation", len(tasks))
 
@@ -67,7 +83,7 @@ def main(argv: list[str] | None = None) -> None:
         for t in tasks
     ]
 
-    # compute rewards
+    # compute rewards (dry-run: uses simulated responses, scores will be low)
     for traj, task in zip(trajectories, tasks):
         traj.reward = reward_plugin.score(task, traj)
 
