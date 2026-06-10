@@ -88,14 +88,13 @@ def build_grpo_batch(
         attn_mask[i, :L] = True
         resp_mask[i, :L] = rmask.to(device)
 
-    # ---- 3. Compute new logprobs ---------------------------------------------------------
-    with torch.no_grad():
-        logits = model(padded_ids, attention_mask=attn_mask).logits
-        new_lp_full = F.log_softmax(logits, dim=-1)
-        # Shift: logprob of token t is at position t-1
-        new_lp = new_lp_full[:, :-1, :].gather(
-            2, padded_ids[:, 1:].unsqueeze(-1)
-        ).squeeze(-1)  # [B, L-1]
+    # ---- 3. Compute new logprobs (with grad for loss.backward()) -------------------------
+    logits = model(padded_ids, attention_mask=attn_mask).logits
+    new_lp_full = F.log_softmax(logits, dim=-1)
+    # Shift: logprob of token t is at position t-1
+    new_lp = new_lp_full[:, :-1, :].gather(
+        2, padded_ids[:, 1:].unsqueeze(-1)
+    ).squeeze(-1)  # [B, L-1]
 
     # ---- 4. Extract response-only slices ------------------------------------------------
     # old_logprobs are stored per-trajectory (response-only).

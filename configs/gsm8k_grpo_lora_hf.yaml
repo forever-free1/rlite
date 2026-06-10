@@ -38,7 +38,7 @@ trainer:
     - k_proj
     - v_proj
     - o_proj
-  learning_rate: 2e-5
+  learning_rate: 2.0e-5
   max_grad_norm: 1.0
   train_steps: 100
   batch_size: 4
