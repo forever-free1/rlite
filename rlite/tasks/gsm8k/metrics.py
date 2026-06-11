@@ -38,7 +38,9 @@ class GSM8KMetric(MetricPlugin):
                 # We count correct rewards instead: if reward >= 1.0 it was an exact match.
                 if traj.reward is not None and traj.reward >= 1.0:
                     correct += 1
-            total_length += len(traj.final_response)
+            # Token-based length (not character count)
+            token_ids = traj.steps[0].token_ids if traj.steps else []
+            total_length += len(token_ids) if token_ids else 0
 
         return {
             "exact_match": correct / n,
