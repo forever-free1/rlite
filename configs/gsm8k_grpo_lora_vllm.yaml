@@ -1,0 +1,55 @@
+### GSM8K LoRA-GRPO training with vLLM rollout
+###
+### Usage:
+###   python -m rlite.train --config configs/gsm8k_grpo_lora_vllm.yaml
+
+task:
+  name: gsm8k
+  split: train
+  max_samples: 20    # prompts per training step
+
+reward:
+  name: gsm8k
+  kwargs:
+    exact_match_weight: 1.0
+    format_reward_weight: 0.5
+    invalid_penalty: -0.5
+
+rollout:
+  engine: vllm
+  n_samples: 4       # K responses per prompt
+  temperature: 0.8
+  top_p: 0.95
+  max_tokens: 256
+  model_name: "Qwen/Qwen2.5-1.5B-Instruct"
+  dtype: "bfloat16"
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.35
+
+algo:
+  name: grpo
+  eps: 0.2
+  kl_coef: 0.0
+
+trainer:
+  method: lora
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+  learning_rate: 2.0e-5
+  max_grad_norm: 1.0
+  train_steps: 100
+  batch_size: 4
+  save_steps: 50
+  eval_steps: 25
+  log_steps: 5
+  output_dir: "./outputs/gsm8k_grpo_lora_vllm"
+
+logging:
+  level: INFO
+  log_dir: "./logs"

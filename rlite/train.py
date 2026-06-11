@@ -21,7 +21,6 @@ from rlite.core.batch import build_grpo_batch
 from rlite.core.rollout_types import RolloutReq
 from rlite.logging import logger, setup_logging
 from rlite.registry import metric_registry, reward_registry, task_registry
-from rlite.rollout.hf_engine import HFRolloutEngine
 from rlite.trainers.lora_trainer import LoRATrainer
 
 
@@ -96,11 +95,27 @@ def main(argv: list[str] | None = None) -> None:
         model, lora_config, lr=cfg.trainer.learning_rate,
         max_grad_norm=cfg.trainer.max_grad_norm,
     )
-    # trainer.model is the PeftModel — use that for rollout
+    # ---- Rollout engine ---------------------------------------------------
+    # rollout_model is always the PeftModel (needed for build_grpo_batch)
     rollout_model = trainer.model
 
-    # ---- Rollout engine ---------------------------------------------------
-    rollout_engine = HFRolloutEngine(rollout_model, tokenizer)
+    if cfg.rollout.engine == "vllm":
+        from rlite.rollout.vllm_engine import VLLMRolloutEngine
+
+        rollout_engine = VLLMRolloutEngine(
+            model_name=cfg.rollout.model_name or model_name,
+            tokenizer=tokenizer,
+            lora_rank=cfg.trainer.lora_rank,
+            tensor_parallel_size=cfg.rollout.tensor_parallel_size,
+            gpu_memory_utilization=cfg.rollout.gpu_memory_utilization,
+            dtype=cfg.rollout.dtype,
+        )
+        logger.info("Rollout: VLLMRolloutEngine (engine=vllm)")
+    else:
+        from rlite.rollout.hf_engine import HFRolloutEngine
+
+        rollout_engine = HFRolloutEngine(rollout_model, tokenizer)
+        logger.info("Rollout: HFRolloutEngine (engine=hf)")
 
     # ---- Eval data (fixed subset for monitoring) --------------------------
     eval_tasks = list(task_plugin.load_dataset(
@@ -163,6 +178,13 @@ def main(argv: list[str] | None = None) -> None:
 
         # --- 5. Train step ---
         trainer.train_step(loss)
+
+        # --- 5b. Sync adapter to vLLM engine (vLLM has its own model copy) ---
+        if cfg.rollout.engine == "vllm":
+            adapter_tmp_dir = output_dir / "adapter_current"
+            adapter_tmp_dir.mkdir(parents=True, exist_ok=True)
+            trainer.save_checkpoint(str(adapter_tmp_dir))
+            rollout_engine.reload_adapter(str(adapter_tmp_dir))
 
         # --- 6. Log ---
         t_elapsed = time.time() - t_start
