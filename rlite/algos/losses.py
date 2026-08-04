@@ -29,6 +29,7 @@ def clipped_surrogate_loss(
     ratio: torch.Tensor,
     advantage: torch.Tensor,
     eps_clip: float = 0.2,
+    eps_high: float | None = None,
 ) -> torch.Tensor:
     """PPO-style clipped surrogate objective.
 
@@ -44,9 +45,26 @@ def clipped_surrogate_loss(
         loss: ``[B, L]`` per-token loss (not yet reduced).
     """
     advantage = advantage.unsqueeze(-1)  # [B] → [B, 1]
-    clipped = torch.clamp(ratio, 1.0 - eps_clip, 1.0 + eps_clip)
+    upper = eps_clip if eps_high is None else eps_high
+    clipped = torch.clamp(ratio, 1.0 - eps_clip, 1.0 + upper)
     loss = -torch.min(ratio * advantage, clipped * advantage)
     return loss
+
+
+def masked_token_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Average over every valid response token in the whole batch."""
+    mask_f = mask.to(values.dtype)
+    return (values * mask_f).sum() / mask_f.sum().clamp(min=1)
+
+
+def masked_sample_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Average within each response first, then give every response equal weight."""
+    mask_f = mask.to(values.dtype)
+    per_sample = (values * mask_f).sum(dim=-1) / mask_f.sum(dim=-1).clamp(min=1)
+    valid_samples = mask_f.sum(dim=-1) > 0
+    if not valid_samples.any():
+        return values.sum() * 0.0
+    return per_sample[valid_samples].mean()
 
 
 def apply_response_mask(

@@ -11,8 +11,8 @@ class BaseTrainer(ABC):
     """Interface for training backends (LoRA, DeepSpeed LoRA, etc.)."""
 
     @abstractmethod
-    def train_step(self, loss: torch.Tensor) -> None:
-        """Backward pass + optimizer step."""
+    def train_step(self, loss: torch.Tensor) -> bool:
+        """Backward pass; return whether an optimizer update was applied."""
         ...
 
     @abstractmethod

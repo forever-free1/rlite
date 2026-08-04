@@ -31,6 +31,7 @@ class LoRATrainer(BaseTrainer):
         lora_config: LoraConfig | None = None,
         lr: float = 1e-5,
         max_grad_norm: float = 1.0,
+        gradient_accumulation_steps: int = 1,
     ):
         if lora_config is None:
             lora_config = LoraConfig(
@@ -56,19 +57,45 @@ class LoRATrainer(BaseTrainer):
             self.model.parameters(), lr=lr
         )
         self.max_grad_norm = max_grad_norm
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self._micro_step = 0
+        self.optimizer.zero_grad()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def train_step(self, loss: torch.Tensor) -> None:
+    def train_step(self, loss: torch.Tensor) -> bool:
         """Standard backward → clip → step."""
-        self.optimizer.zero_grad()
-        loss.backward()
+        (loss / self.gradient_accumulation_steps).backward()
+        self._micro_step += 1
+        if self._micro_step % self.gradient_accumulation_steps != 0:
+            return False
         torch.nn.utils.clip_grad_norm_(
             self.model.parameters(), self.max_grad_norm
         )
         self.optimizer.step()
+        self.optimizer.zero_grad()
+        return True
+
+    def begin_batch(self) -> None:
+        """Clear gradients before a logical batch made of bounded microbatches."""
+        if self._micro_step % self.gradient_accumulation_steps == 0:
+            self.optimizer.zero_grad()
+
+    def backward_microbatch(self, loss: torch.Tensor, weight: float) -> None:
+        """Accumulate a weighted microbatch loss without stepping."""
+        (loss * weight / self.gradient_accumulation_steps).backward()
+
+    def finish_batch(self) -> bool:
+        """Finish one logical batch, honoring logical gradient accumulation."""
+        self._micro_step += 1
+        if self._micro_step % self.gradient_accumulation_steps != 0:
+            return False
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+        return True
 
     def save_checkpoint(self, path: str) -> None:
         """Save LoRA adapter weights."""

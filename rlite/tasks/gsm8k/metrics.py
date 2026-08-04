@@ -40,7 +40,8 @@ class GSM8KMetric(MetricPlugin):
                     correct += 1
             # Token-based length (not character count)
             token_ids = traj.steps[0].token_ids if traj.steps else []
-            total_length += len(token_ids) if token_ids else 0
+            # Text-only test/debug trajectories do not have tokenizer output.
+            total_length += len(token_ids) if token_ids else len(traj.final_response.split())
 
         return {
             "exact_match": correct / n,

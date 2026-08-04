@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import random
 import sys
 import time
 from pathlib import Path
@@ -17,11 +18,54 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from rlite.algos.grpo import grpo_loss
 from rlite.config import load_config
-from rlite.core.batch import build_grpo_batch
+from rlite.core.batch import iter_grpo_microbatches, prepare_grpo_experience
+from rlite.algos.advantages import compute_group_advantages
 from rlite.core.rollout_types import RolloutReq
 from rlite.logging import logger, setup_logging
 from rlite.registry import metric_registry, reward_registry, task_registry
 from rlite.trainers.lora_trainer import LoRATrainer
+
+
+class ShuffledTaskSampler:
+    """Seeded cyclic sampler that loads a dataset once and reshuffles per epoch."""
+
+    def __init__(self, tasks, seed: int):
+        if not tasks:
+            raise ValueError("Training dataset is empty")
+        self.tasks = list(tasks)
+        self.rng = random.Random(seed)
+        self.order: list[int] = []
+        self.position = 0
+        self._reshuffle()
+
+    def _reshuffle(self) -> None:
+        self.order = list(range(len(self.tasks)))
+        self.rng.shuffle(self.order)
+        self.position = 0
+
+    def sample(self, size: int):
+        result = []
+        while len(result) < size:
+            if self.position == len(self.order):
+                self._reshuffle()
+            take = min(size - len(result), len(self.order) - self.position)
+            indices = self.order[self.position:self.position + take]
+            result.extend(self.tasks[i] for i in indices)
+            self.position += take
+        return result
+
+
+def score_trajectories(trajectories, tasks, reward_plugin) -> None:
+    """Score by explicit task id; trajectory ordering is never assumed."""
+    task_by_id = {task.task_id: task for task in tasks}
+    for trajectory in trajectories:
+        try:
+            task = task_by_id[trajectory.task_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"Rollout returned unknown task_id {trajectory.task_id!r}"
+            ) from exc
+        trajectory.reward = reward_plugin.score(task, trajectory)
 
 
 def _load_plugins(task_name: str) -> None:
@@ -36,7 +80,7 @@ def _load_plugins(task_name: str) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="rlite train — pluggable LoRA-GRPO/DAPO RL training"
+        description="rlite train - lightweight LoRA-GRPO training"
     )
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config")
     args = parser.parse_args(argv)
@@ -47,6 +91,10 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
 
     cfg = load_config(config_path)
+    random.seed(cfg.trainer.seed)
+    torch.manual_seed(cfg.trainer.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.trainer.seed)
     setup_logging(level=cfg.logging.level, log_dir=cfg.logging.log_dir)
     logger.info("=" * 60)
     logger.info("rlite train — LoRA-GRPO on %s", cfg.task.name)
@@ -94,6 +142,7 @@ def main(argv: list[str] | None = None) -> None:
     trainer = LoRATrainer(
         model, lora_config, lr=cfg.trainer.learning_rate,
         max_grad_norm=cfg.trainer.max_grad_norm,
+        gradient_accumulation_steps=cfg.trainer.gradient_accumulation_steps,
     )
     # ---- Rollout engine ---------------------------------------------------
     # rollout_model is always the PeftModel (needed for build_grpo_batch)
@@ -109,6 +158,9 @@ def main(argv: list[str] | None = None) -> None:
             tensor_parallel_size=cfg.rollout.tensor_parallel_size,
             gpu_memory_utilization=cfg.rollout.gpu_memory_utilization,
             dtype=cfg.rollout.dtype,
+            enable_prefix_caching=cfg.rollout.enable_prefix_caching,
+            group_admission=cfg.rollout.group_admission,
+            max_model_len=cfg.rollout.max_model_len,
         )
         logger.info("Rollout: VLLMRolloutEngine (engine=vllm)")
     else:
@@ -123,12 +175,17 @@ def main(argv: list[str] | None = None) -> None:
     ))
     logger.info("Eval tasks: %d", len(eval_tasks))
 
+    train_tasks = list(task_plugin.load_dataset(
+        split=cfg.task.split, max_samples=cfg.task.max_samples
+    ))
+    sampler = ShuffledTaskSampler(train_tasks, cfg.trainer.seed)
+    logger.info("Training task pool: %d (seed=%d)", len(train_tasks), cfg.trainer.seed)
+
     # ---- Training loop ----------------------------------------------------
     total_steps = cfg.trainer.train_steps
     batch_size = cfg.trainer.batch_size  # number of prompts per step
     K = cfg.rollout.n_samples
     policy_version = 0
-    best_reward = -float("inf")
     output_dir = Path(cfg.trainer.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -136,51 +193,69 @@ def main(argv: list[str] | None = None) -> None:
                 total_steps, batch_size, K, cfg.trainer.learning_rate)
     logger.info("Output dir: %s", output_dir)
 
+    # A pre-training baseline is required to interpret later evaluation points.
+    _run_eval(
+        eval_tasks, task_plugin, reward_plugin, metric_plugin,
+        rollout_engine, rollout_model, tokenizer, cfg, 0,
+    )
+
     for step in range(1, total_steps + 1):
         t_start = time.time()
 
-        # --- 1. Sample tasks & build prompts ---
-        tasks = list(task_plugin.load_dataset(
-            split=cfg.task.split, max_samples=batch_size
-        ))
+        # --- 1-3. Sample, rollout and score. ---
+        tasks = sampler.sample(batch_size)
         prompts = [task_plugin.build_prompt(t) for t in tasks]
-
-        # --- 2. Rollout ---
         req = RolloutReq(
-            batch_id=f"step_{step:04d}",
-            tasks=tasks,
-            prompts=prompts,
-            n_samples=K,
-            temperature=cfg.rollout.temperature,
-            top_p=cfg.rollout.top_p,
-            max_tokens=cfg.rollout.max_tokens,
+            batch_id=f"step_{step:04d}", tasks=tasks, prompts=prompts,
+            n_samples=K, temperature=cfg.rollout.temperature,
+            top_p=cfg.rollout.top_p, max_tokens=cfg.rollout.max_tokens,
             policy_version=policy_version,
         )
         rollout_resp = rollout_engine.generate(req)
-        policy_version += 1
-
-        # --- 3. Reward ---
-        for traj, task in zip(rollout_resp.trajectories,
-                              tasks * K):  # repeat tasks K times
-            traj.reward = reward_plugin.score(task, traj)
+        score_trajectories(rollout_resp.trajectories, tasks, reward_plugin)
 
         # --- 4. Build batch & compute loss ---
-        batch = build_grpo_batch(rollout_resp, rollout_model, tokenizer)
-        loss, algo_metrics = grpo_loss(
-            batch["rewards"],
-            batch["old_logprobs"],
-            batch["new_logprobs"],
-            batch["response_mask"],
-            batch["group_ids"],
-            eps_clip=cfg.algo.eps,
-            kl_coef=cfg.algo.kl_coef,
+        experience = prepare_grpo_experience(rollout_resp, tokenizer)
+        advantages, advantage_metrics = compute_group_advantages(
+            experience.rewards, experience.group_ids
         )
+        total_samples = len(experience.input_ids)
+        metric_sums: dict[str, float] = {}
+        microbatch_count = 0
+        sample_offset = 0
+        trainer.begin_batch()
+        for batch, micro_samples in iter_grpo_microbatches(
+            experience,
+            rollout_model,
+            max_sequences=cfg.trainer.micro_batch_size_per_gpu,
+            max_tokens=cfg.trainer.max_tokens_per_micro_batch,
+        ):
+            microbatch_count += 1
+            micro_advantages = advantages[
+                sample_offset:sample_offset + micro_samples
+            ].to(batch.rewards.device)
+            loss, micro_metrics = grpo_loss(
+                batch.rewards, batch.old_logprobs, batch.new_logprobs,
+                batch.response_mask, batch.group_ids,
+                eps_clip=cfg.algo.eps, kl_coef=cfg.algo.kl_coef,
+                advantages=micro_advantages,
+            )
+            weight = micro_samples / total_samples
+            trainer.backward_microbatch(loss, weight)
+            for key, value in micro_metrics.items():
+                metric_sums[key] = metric_sums.get(key, 0.0) + value * weight
+            sample_offset += micro_samples
+
+        algo_metrics = {**metric_sums, **advantage_metrics}
+        algo_metrics["loss"] = metric_sums.get("loss", 0.0)
 
         # --- 5. Train step ---
-        trainer.train_step(loss)
+        updated = trainer.finish_batch()
+        if updated:
+            policy_version += 1
 
         # --- 5b. Sync adapter to vLLM engine (vLLM has its own model copy) ---
-        if cfg.rollout.engine == "vllm":
+        if cfg.rollout.engine == "vllm" and updated:
             adapter_tmp_dir = output_dir / "adapter_current"
             adapter_tmp_dir.mkdir(parents=True, exist_ok=True)
             trainer.save_checkpoint(str(adapter_tmp_dir))
@@ -189,13 +264,14 @@ def main(argv: list[str] | None = None) -> None:
         # --- 6. Log ---
         t_elapsed = time.time() - t_start
         if step % cfg.trainer.log_steps == 0 or step == 1:
-            reward_mean = batch["rewards"].mean().item()
+            reward_mean = experience.rewards.mean().item()
             logger.info(
                 "[step %4d/%d] loss=%7.4f | reward=%6.3f | "
-                "nonzero_adv=%5.3f | kl=%6.4f | time=%5.1fs",
+                "nonzero_adv=%5.3f | kl=%6.4f | microbatches=%d | "
+                "tokens=%d | time=%5.1fs",
                 step, total_steps, algo_metrics["loss"], reward_mean,
                 algo_metrics["nonzero_advantage_ratio"], algo_metrics["kl"],
-                t_elapsed,
+                microbatch_count, experience.token_count, t_elapsed,
             )
 
         # --- 7. Eval ---

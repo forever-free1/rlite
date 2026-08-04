@@ -81,7 +81,20 @@ class HFRolloutEngine(RolloutEngine):
         out = self.model.generate(**tokenized, **gen_kwargs)  # [B, L_full]
 
         # ---- 3. Compute old-policy logprobs (batched forward) ---------
-        all_logprobs = self._compute_logprobs(out)  # [B, L_full-1]
+        generated_width = out.shape[1] - padded_len
+        full_attention_mask = torch.cat(
+            [
+                attn_mask,
+                torch.ones(
+                    out.shape[0], generated_width,
+                    dtype=attn_mask.dtype, device=attn_mask.device,
+                ),
+            ],
+            dim=1,
+        )
+        all_logprobs = self._compute_logprobs(
+            out, attention_mask=full_attention_mask
+        )  # [B, L_full-1]
 
         # ---- 4. Extract per-trajectory results -------------------------
         # With left-padding, response starts at padded_len for all examples.
@@ -132,7 +145,11 @@ class HFRolloutEngine(RolloutEngine):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _compute_logprobs(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def _compute_logprobs(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Compute token-level log-probabilities via a single forward pass.
 
         Args:
@@ -141,7 +158,7 @@ class HFRolloutEngine(RolloutEngine):
         Returns:
             ``[B, L-1]`` logprobs: for each position i, the logprob of token at i+1.
         """
-        logits = self.model(input_ids).logits  # [B, L, V]
+        logits = self.model(input_ids, attention_mask=attention_mask).logits  # [B, L, V]
         logprobs = F.log_softmax(logits, dim=-1)
         # gather the logprob of the *actual* next token
         shifted = logprobs[:, :-1, :].gather(

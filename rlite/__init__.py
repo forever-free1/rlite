@@ -1,3 +1,3 @@
-"""rlite: A plugin-based LoRA-GRPO/DAPO framework for verifiable LLM skill training."""
+"""rlite: a lightweight, inspectable GRPO training framework."""
 
 __version__ = "0.1.0"
