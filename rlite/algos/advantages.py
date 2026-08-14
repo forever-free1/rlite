@@ -59,7 +59,7 @@ def compute_group_advantages(
 
         if std_r < eps or mask.sum().item() <= 1:
             # All rewards in this group are identical — set advantages to zero.
-            # This is a "filtered group" in DAPO terminology (no learning signal).
+            # A constant-reward group provides no relative learning signal.
             advantages[mask] = 0.0
             filtered_groups += 1
         else:

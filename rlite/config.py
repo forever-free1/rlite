@@ -39,53 +39,18 @@ class RolloutConfig:
     # vLLM-specific
     tensor_parallel_size: int = 1
     gpu_memory_utilization: float = 0.9
-
-
-@dataclass
-class DAPODynamicSamplingConfig:
-    enabled: bool = False
-
-
-@dataclass
-class DAPOClipHigherConfig:
-    enabled: bool = False
-    eps_low: float = 0.2
-    eps_high: float = 0.28
-
-
-@dataclass
-class DAPOTokenLevelLossConfig:
-    enabled: bool = False
-
-
-@dataclass
-class DAPOOverlongPenaltyConfig:
-    enabled: bool = False
-    max_len: int = 1024
-    penalty: float = -0.2
-
-
-@dataclass
-class DAPOConfig:
-    enabled: bool = False
-    dynamic_sampling: DAPODynamicSamplingConfig = field(
-        default_factory=DAPODynamicSamplingConfig
-    )
-    clip_higher: DAPOClipHigherConfig = field(default_factory=DAPOClipHigherConfig)
-    token_level_loss: DAPOTokenLevelLossConfig = field(
-        default_factory=DAPOTokenLevelLossConfig
-    )
-    overlong_penalty: DAPOOverlongPenaltyConfig = field(
-        default_factory=DAPOOverlongPenaltyConfig
-    )
+    max_model_len: int | None = None
+    enable_prefix_caching: bool = True
+    group_admission: str = "native"  # "native" | "leader"
 
 
 @dataclass
 class AlgoConfig:
-    name: str = "grpo"  # "grpo"
+    name: str = "grpo"  # "grpo" | "dapo" | "gspo"
     eps: float = 0.2  # clip epsilon
+    eps_high: float = 0.28  # DAPO asymmetric upper clip
     kl_coef: float = 0.0  # optional KL penalty
-    dapo: DAPOConfig = field(default_factory=DAPOConfig)
+    dynamic_sampling_max_rounds: int = 8
 
 
 @dataclass
@@ -102,6 +67,8 @@ class TrainerConfig:
     train_steps: int = 100
     batch_size: int = 4
     gradient_accumulation_steps: int = 1
+    micro_batch_size_per_gpu: int = 1
+    max_tokens_per_micro_batch: int | None = 1024
     save_steps: int = 50
     eval_steps: int = 50
     log_steps: int = 10
@@ -134,28 +101,40 @@ class RLiteConfig:
     # convenience: the path this config was loaded from
     _config_path: str | None = field(default=None, repr=False)
 
+    def validate(self) -> None:
+        """Reject configurations whose advertised behaviour is unsupported."""
+        if self.algo.name not in {"grpo", "dapo", "gspo"}:
+            raise ValueError("algo.name must be 'grpo', 'dapo', or 'gspo'")
+        if self.algo.eps <= 0 or self.algo.eps_high <= 0:
+            raise ValueError("algorithm clip ranges must be positive")
+        if self.algo.dynamic_sampling_max_rounds <= 0:
+            raise ValueError("dynamic_sampling_max_rounds must be positive")
+        if self.rollout.engine not in {"hf", "vllm"}:
+            raise ValueError("rollout.engine must be 'hf' or 'vllm'")
+        if self.trainer.method != "lora":
+            raise ValueError("Only trainer.method='lora' is currently implemented")
+        if self.task.split == "train" and self.rollout.n_samples < 2:
+            raise ValueError("Group-relative algorithms require rollout.n_samples >= 2")
+        if self.trainer.batch_size <= 0 or self.trainer.train_steps <= 0:
+            raise ValueError("trainer batch_size and train_steps must be positive")
+        if self.trainer.gradient_accumulation_steps <= 0:
+            raise ValueError("gradient_accumulation_steps must be positive")
+        if self.trainer.micro_batch_size_per_gpu <= 0:
+            raise ValueError("micro_batch_size_per_gpu must be positive")
+        if (self.trainer.max_tokens_per_micro_batch is not None
+                and self.trainer.max_tokens_per_micro_batch <= 0):
+            raise ValueError("max_tokens_per_micro_batch must be positive when set")
+        if not 0.0 <= self.rollout.top_p <= 1.0:
+            raise ValueError("rollout.top_p must be in [0, 1]")
+        if self.rollout.group_admission not in {"native", "leader"}:
+            raise ValueError("rollout.group_admission must be 'native' or 'leader'")
+        if self.rollout.max_model_len is not None and self.rollout.max_model_len <= 0:
+            raise ValueError("rollout.max_model_len must be positive when set")
+
 
 # ---------------------------------------------------------------------------
 # YAML loading
 # ---------------------------------------------------------------------------
-
-
-def _dict_to_dapo_config(d: dict[str, Any] | None) -> DAPOConfig:
-    if d is None:
-        return DAPOConfig()
-    return DAPOConfig(
-        enabled=d.get("enabled", False),
-        dynamic_sampling=DAPODynamicSamplingConfig(
-            **d.get("dynamic_sampling", {})
-        ),
-        clip_higher=DAPOClipHigherConfig(**d.get("clip_higher", {})),
-        token_level_loss=DAPOTokenLevelLossConfig(
-            **d.get("token_level_loss", {})
-        ),
-        overlong_penalty=DAPOOverlongPenaltyConfig(
-            **d.get("overlong_penalty", {})
-        ),
-    )
 
 
 def load_config(path: str | Path) -> RLiteConfig:
@@ -168,14 +147,12 @@ def load_config(path: str | Path) -> RLiteConfig:
         task=TaskConfig(**raw.get("task", {})),
         reward=RewardConfig(**raw.get("reward", {})),
         rollout=RolloutConfig(**raw.get("rollout", {})),
-        algo=AlgoConfig(
-            **{k: v for k, v in raw.get("algo", {}).items() if k != "dapo"},
-            dapo=_dict_to_dapo_config(raw.get("algo", {}).get("dapo")),
-        ),
+        algo=AlgoConfig(**raw.get("algo", {})),
         trainer=TrainerConfig(**raw.get("trainer", {})),
         logging=LoggingConfig(**raw.get("logging", {})),
         _config_path=str(path.resolve()),
     )
+    cfg.validate()
     return cfg
 
 
@@ -189,14 +166,9 @@ def save_config(config: RLiteConfig, path: str | Path) -> None:
         "algo": {
             "name": config.algo.name,
             "eps": config.algo.eps,
+            "eps_high": config.algo.eps_high,
             "kl_coef": config.algo.kl_coef,
-            "dapo": {
-                "enabled": config.algo.dapo.enabled,
-                "dynamic_sampling": config.algo.dapo.dynamic_sampling.__dict__,
-                "clip_higher": config.algo.dapo.clip_higher.__dict__,
-                "token_level_loss": config.algo.dapo.token_level_loss.__dict__,
-                "overlong_penalty": config.algo.dapo.overlong_penalty.__dict__,
-            },
+            "dynamic_sampling_max_rounds": config.algo.dynamic_sampling_max_rounds,
         },
         "trainer": config.trainer.__dict__,
         "logging": config.logging.__dict__,

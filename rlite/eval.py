@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import random
 import sys
 from pathlib import Path
 
 from rlite.config import RLiteConfig, load_config
-from rlite.core.types import Trajectory
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from rlite.core.rollout_types import RolloutReq
 from rlite.logging import logger, setup_logging
 
 
@@ -70,28 +74,64 @@ def main(argv: list[str] | None = None) -> None:
     reward_plugin = reward_registry.create(cfg.reward.name, **cfg.reward.kwargs)
     metric_plugin = metric_registry.create(cfg.task.name)
 
-    # 5. eval: load tasks, create dummy trajectories, score and compute metrics
+    random.seed(cfg.trainer.seed)
+    torch.manual_seed(cfg.trainer.seed)
+
+    # 5. Load the real policy and rollout backend.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = AutoModelForCausalLM.from_pretrained(
+        cfg.rollout.model_name,
+        torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
+        device_map="auto" if device.type == "cuda" else None,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(cfg.rollout.model_name)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = "left"
+
+    if cfg.rollout.engine == "vllm":
+        from rlite.rollout.vllm_engine import VLLMRolloutEngine
+        engine = VLLMRolloutEngine(
+            cfg.rollout.model_name,
+            tokenizer,
+            lora_rank=cfg.trainer.lora_rank,
+            tensor_parallel_size=cfg.rollout.tensor_parallel_size,
+            gpu_memory_utilization=cfg.rollout.gpu_memory_utilization,
+            dtype=cfg.rollout.dtype,
+            enable_prefix_caching=cfg.rollout.enable_prefix_caching,
+            group_admission=cfg.rollout.group_admission,
+            max_model_len=cfg.rollout.max_model_len,
+        )
+        if args.checkpoint:
+            engine.reload_adapter(args.checkpoint)
+    else:
+        if args.checkpoint:
+            from peft import PeftModel
+            model = PeftModel.from_pretrained(model, args.checkpoint)
+        from rlite.rollout.hf_engine import HFRolloutEngine
+        engine = HFRolloutEngine(model, tokenizer)
+
+    # 6. Generate and score real responses.
     tasks = list(task_plugin.load_dataset(split=cfg.task.split, max_samples=cfg.task.max_samples))
     logger.info("Loaded %d tasks for evaluation", len(tasks))
+    prompts = [task_plugin.build_prompt(t) for t in tasks]
+    response = engine.generate(RolloutReq(
+        batch_id="eval",
+        tasks=tasks,
+        prompts=prompts,
+        n_samples=1,
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=cfg.rollout.max_tokens,
+        policy_version=-1,
+    ))
+    task_by_id = {t.task_id: t for t in tasks}
+    for trajectory in response.trajectories:
+        trajectory.reward = reward_plugin.score(task_by_id[trajectory.task_id], trajectory)
 
-    trajectories = [
-        Trajectory.from_single_response(
-            task_id=t.task_id,
-            prompt=task_plugin.build_prompt(t),
-            response=f"simulated response for {t.task_id}",
-        )
-        for t in tasks
-    ]
-
-    # compute rewards (dry-run: uses simulated responses, scores will be low)
-    for traj, task in zip(trajectories, tasks):
-        traj.reward = reward_plugin.score(task, traj)
-
-    # compute metrics
-    metrics = metric_plugin.compute(trajectories)
+    metrics = metric_plugin.compute(response.trajectories)
     logger.info("Eval metrics: %s", metrics)
-
-    logger.info("Eval dry-run complete.")
+    logger.info("Evaluation complete.")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,42 @@
+task: {name: gsm8k, split: train, max_samples: 1000}
+reward:
+  name: gsm8k
+  kwargs: {exact_match_weight: 1.0, format_reward_weight: 0.5, invalid_penalty: -0.5}
+rollout:
+  engine: vllm
+  n_samples: 4
+  temperature: 0.8
+  top_p: 0.95
+  max_tokens: 256
+  model_name: Qwen/Qwen2.5-1.5B-Instruct
+  dtype: float16
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.35
+  max_model_len: 2048
+  enable_prefix_caching: true
+  group_admission: leader
+algo:
+  name: dapo
+  eps: 0.2
+  eps_high: 0.28
+  kl_coef: 0.0
+  dynamic_sampling_max_rounds: 32
+trainer:
+  method: lora
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  learning_rate: 2.0e-5
+  max_grad_norm: 1.0
+  train_steps: 200
+  batch_size: 2
+  gradient_accumulation_steps: 1
+  micro_batch_size_per_gpu: 1
+  max_tokens_per_micro_batch: 768
+  seed: 42
+  save_steps: 25
+  eval_steps: 10
+  log_steps: 1
+  output_dir: /root/rlite-runs/ray-dapo-qwen1.5b-seed42
+logging: {level: INFO, log_dir: /root/rlite-logs/ray-dapo-qwen1.5b-seed42}

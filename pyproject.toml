@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rlite"
 version = "0.1.0"
-description = "A plugin-based LoRA-GRPO/DAPO framework for verifiable LLM skill training"
+description = "A lightweight framework for reproducing LLM policy-optimization algorithms"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -15,7 +15,6 @@ authors = [
 keywords = [
     "rlhf",
     "grpo",
-    "dapo",
     "lora",
     "llm",
     "reinforcement-learning",
@@ -38,12 +37,16 @@ dependencies = [
     "accelerate>=0.28.0",
     "datasets>=2.18.0",
     "pyyaml>=6.0",
+    "ray[default]>=2.20.0",
 ]
 
 [project.optional-dependencies]
-vllm = ["vllm>=0.4.0"]
-ray = ["ray>=2.9.0"]
-deepseek = ["deepspeed>=0.13.0"]
+vllm = [
+    "vllm==0.6.6.post1",
+    "transformers==4.47.1",
+    "mistral-common==1.5.1",
+    "opencv-python-headless==4.11.0.86",
+]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=4.0",
@@ -52,12 +55,11 @@ docs = [
     "myst-parser>=2.0",
     "sphinx>=7.0",
 ]
-all = [
-    "rlite[vllm,ray,dev,docs]",
-]
+all = ["rlite[vllm,dev,docs]"]
 
 [project.scripts]
 rlite-train = "rlite.train:main"
+rlite-ray-train = "rlite.ray_train:main"
 rlite-eval = "rlite.eval:main"
 
 [tool.setuptools.packages.find]

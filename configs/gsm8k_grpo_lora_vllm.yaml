@@ -6,7 +6,7 @@
 task:
   name: gsm8k
   split: train
-  max_samples: 20    # prompts per training step
+  max_samples: 1000  # size of the shuffled training pool
 
 reward:
   name: gsm8k
@@ -25,6 +25,9 @@ rollout:
   dtype: "bfloat16"
   tensor_parallel_size: 1
   gpu_memory_utilization: 0.35
+  max_model_len: 2048
+  enable_prefix_caching: true
+  group_admission: native  # native | leader (experimental)
 
 algo:
   name: grpo
@@ -45,6 +48,8 @@ trainer:
   max_grad_norm: 1.0
   train_steps: 100
   batch_size: 4
+  gradient_accumulation_steps: 1
+  seed: 42
   save_steps: 50
   eval_steps: 25
   log_steps: 5
